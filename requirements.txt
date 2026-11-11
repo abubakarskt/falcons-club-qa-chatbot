@@ -1,2 +1,5 @@
 Flask==3.0.3
 openai>=1.0.0
+sentence-transformers>=2.7.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0

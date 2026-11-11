@@ -1,110 +1,138 @@
-from pathlib import Path
+from functools import lru_cache
 import json
 import os
 import re
+from pathlib import Path
 
+import faiss
+import numpy as np
 from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 PROMPT_PATH = BASE_DIR / "prompts" / "club_qa_prompt.txt"
+INDEX_PATH = DATA_DIR / "index.faiss"
+CHUNKS_PATH = DATA_DIR / "chunks.json"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 def load_documents():
     docs = []
     for file in sorted(DATA_DIR.glob("*.txt")):
-        docs.append({
-            "title": file.stem.replace("_", " ").title(),
-            "path": str(file),
-            "text": file.read_text(encoding="utf-8")
-        })
+        docs.append(
+            {
+                "title": file.stem.replace("_", " ").title(),
+                "path": str(file),
+                "text": file.read_text(encoding="utf-8"),
+            }
+        )
     return docs
 
 
-def find_best_document(question, documents):
-    normalized_question = question.lower()
-    candidates = []
-
-    for doc in documents:
-        score = 0
-        text = doc["text"].lower()
-        for token in re.findall(r"[a-z]+", normalized_question):
-            if token in text:
-                score += 1
-        candidates.append((score, doc))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    if candidates and candidates[0][0] > 0:
-        return candidates[0][1]
-    return documents[0]
+def split_documents_into_chunks():
+    chunks = []
+    for file in sorted(DATA_DIR.glob("*.txt")):
+        text = file.read_text(encoding="utf-8")
+        for paragraph in re.split(r"\n\s*\n", text):
+            paragraph = paragraph.strip()
+            if paragraph:
+                chunks.append({"source": file.name, "text": paragraph})
+    return chunks
 
 
-def build_prompt(question, context):
+@lru_cache(maxsize=1)
+def get_embedding_model():
+    return SentenceTransformer(EMBEDDING_MODEL)
+
+
+def build_index():
+    chunks = split_documents_into_chunks()
+    if not chunks:
+        raise RuntimeError(f"No paragraph text found in {DATA_DIR}.")
+
+    model = get_embedding_model()
+    vectors = model.encode(
+        [chunk["text"] for chunk in chunks],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).astype(np.float32)
+
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(INDEX_PATH))
+    CHUNKS_PATH.write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
+    return index, chunks
+
+
+def load_faiss_index():
+    if not INDEX_PATH.exists() or not CHUNKS_PATH.exists():
+        build_index()
+    index = faiss.read_index(str(INDEX_PATH))
+    chunks = json.loads(CHUNKS_PATH.read_text(encoding="utf-8"))
+    return index, chunks
+
+
+def retrieve_chunks(question, top_k=3):
+    index, chunks = load_faiss_index()
+    if index.ntotal == 0:
+        return []
+
+    vector = get_embedding_model().encode(
+        [question], convert_to_numpy=True, normalize_embeddings=True
+    ).astype(np.float32)
+    _, ids = index.search(vector, min(top_k, index.ntotal))
+    return [chunks[int(i)] for i in ids[0] if i >= 0]
+
+
+def build_prompt(question, context_chunks):
     template = PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(question=question, context=context)
+    context = "\n\n".join(
+        f"Source: {chunk['source']}\n{chunk['text']}" for chunk in context_chunks
+    )
+    return template.replace("{question}", question).replace("{context}", context)
 
 
 def parse_json_response(raw_text):
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
     data = json.loads(cleaned)
-    if "answer" in data and "source" in data:
-        return {"answer": str(data["answer"]), "source": str(data["source"])}
-    raise ValueError("Model response did not contain answer and source keys.")
+    if not isinstance(data, dict) or "answer" not in data:
+        raise ValueError("Model response did not contain an answer field.")
+    return str(data["answer"])
 
 
-def ask_openai(question, context):
+def ask_openai(question, context_chunks):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
 
     client = OpenAI(api_key=api_key)
-    prompt = build_prompt(question, context)
+    prompt = build_prompt(question, context_chunks)
     response = client.responses.create(
-        model="gpt-4o-mini",
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         input=prompt,
         temperature=0,
     )
-    raw_text = response.output_text
-    return parse_json_response(raw_text)
-
-
-def fallback_answer(question):
-    docs = load_documents()
-    doc = find_best_document(question, docs)
-    text = doc["text"]
-    lower_text = text.lower()
-
-    if "membership" in question.lower() and "fee" in question.lower():
-        answer = "Membership is $35 per month for standard members, with a discounted student rate of $18 per month."
-        source = doc["title"]
-    elif "event" in question.lower() or "schedule" in question.lower():
-        answer = "The next club event is the Falcons Night Run on Saturday at 6:30 PM. Members can also attend the monthly team watch party and the community cleanup day."
-        source = doc["title"]
-    elif "rule" in question.lower() or "conduct" in question.lower():
-        answer = "Members must treat all guests respectfully, follow facility safety rules, and attend check-in before entering the training area."
-        source = doc["title"]
-    elif "faq" in question.lower() or "member" in question.lower():
-        answer = "Members receive access to events, training updates, and the club communication email list. New members are encouraged to attend orientation before their first session."
-        source = doc["title"]
-    else:
-        answer = "The Falcons Club welcomes members to attend events, participate in training, and stay involved through the club newsletter and community activities."
-        source = doc["title"]
-
-    return {"answer": answer, "source": source}
+    return parse_json_response(response.output_text)
 
 
 def generate_answer(question):
-    documents = load_documents()
     if not question or not question.strip():
-        return {"answer": "Please ask a club question.", "source": "General guidance"}
+        raise ValueError("Question cannot be empty.")
 
-    context = find_best_document(question, documents)["text"]
+    chunks = retrieve_chunks(question.strip(), top_k=3)
+    if not chunks:
+        return {"answer": "I could not find relevant information in the club documents.", "source": ""}
 
+    source = chunks[0]["text"]
     try:
-        return ask_openai(question, context)
+        answer = ask_openai(question.strip(), chunks)
     except Exception:
-        return fallback_answer(question)
+        answer = source
+
+    return {"answer": answer, "source": source}
