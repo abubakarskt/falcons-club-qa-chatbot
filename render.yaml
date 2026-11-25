@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: falcons-club-qa-chatbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && python scripts/build_index.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
